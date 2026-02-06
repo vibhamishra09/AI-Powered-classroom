@@ -124,6 +124,19 @@ GRADIO_SERVER_PORT=7860
 GRADIO_HOST=127.0.0.1
 GRADIO_SHARE=0
 
+# ===========================================
+# MONGODB STORAGE (OPTIONAL)
+# ===========================================
+
+# Enable backend persistence of transcripts, feedback, and Q&A stats
+MONGO_URI=mongodb+srv://username:password@cluster0.mongodb.net
+MONGO_DB_NAME=classroom
+MONGO_COLLECTION=teaching_results
+# Toggle to 0 if you want to run without writing to MongoDB
+MONGO_ENABLED=1
+# Flip to 1 only when connecting to test clusters with self-signed certs
+MONGO_TLS_ALLOW_INVALID_CERTS=0
+
 
 OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen2.5:7b-instruct

@@ -6,6 +6,8 @@ pandas==2.2.2
 tqdm>=4.66.1
 pydub==0.25.1
 soundfile>=0.12.1
+pymongo>=4.9.0
+markdown>=3.4.0
 
 # Transcription
 faster-whisper==1.0.3
@@ -16,7 +18,7 @@ pytesseract==0.3.10
 Pillow>=10.2.0
 
 # Video download
-yt-dlp>=2024.10.22
+yt-dlp>=2025.10.22
 
 # Providers
 groq>=0.32.0

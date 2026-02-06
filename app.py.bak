@@ -17,11 +17,6 @@ import requests
 import gradio as gr
 from faster_whisper import WhisperModel
 
-try:
-    import markdown
-except Exception:
-    markdown = None
-
 # NEW: OpenAI + Gemini SDKs
 try:
     from openai import OpenAI
@@ -82,25 +77,6 @@ APP_EMAIL_RECIPIENTS = [
     "vibhamishra0907@gmail.com",
 ]
 # --------------------------------------------------------------------------------
-
-MODEL_DISPLAY_NAMES = {
-    "groq": "Groq · GPT-OSS-120B",
-    "scout": "Groq · Llama-4-Scout",
-    "openai": "OpenAI · GPT-4o-mini",
-    "gemini": "Google · Gemini",
-    "or_deepseek_r1d_70b": "OpenRouter · DeepSeek R1-Distill-Llama-70B",
-    "or_gemma2_9b_it": "OpenRouter · Gemma2-9B-IT",
-    "ollama": "Local · Ollama",
-}
-MODEL_EMAIL_SECTION_KEYS = [
-    "groq",
-    "scout",
-    "openai",
-    "gemini",
-    "or_deepseek_r1d_70b",
-    "or_gemma2_9b_it",
-]
-MODEL_EMAIL_SECTION_SET = set(MODEL_EMAIL_SECTION_KEYS)
 
 # ===================== Paths & .env loader =====================
 BASE_DIR = Path(__file__).resolve().parent
@@ -484,15 +460,15 @@ def _download_media_from_url(url: str, dest_dir: Path) -> Path:
         "quiet": True,
         "noprogress": True,
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-    files = list(dest_dir.glob(f"{file_id}.*"))
-    if not files:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        files = list(dest_dir.glob(f"{file_id}.*"))
+        if not files:
         guess = Path(ydl.prepare_filename(info))
         if guess.exists():
             return guess
         raise gr.Error("Download succeeded but cannot find the output file.")
-    return files[0]
+        return files[0]
 
 # ===================== Long-media segmentation =====================
 
@@ -880,161 +856,6 @@ def send_report_to_recipients(recipients: List[str], subject: str, body_text: st
         except Exception as e:
             print(f"[email] failed → {a}: {e}")
 
-
-def _parse_recipient_list(raw_list: Optional[str]) -> List[str]:
-    if not raw_list:
-        return []
-    parts = re.split(r"[;,]", raw_list)
-    return [p.strip() for p in parts if p and p.strip()]
-
-
-def _qna_summary_pairs(q_summary: Dict[str, Any]) -> List[Tuple[str, Any]]:
-    return [
-        ("Total items", q_summary.get("total_items", 0)),
-        ("Student questions", q_summary.get("total_student_questions", 0)),
-        ("Teacher questions", q_summary.get("total_teacher_questions", 0)),
-        ("Answered (est.)", q_summary.get("answered", 0)),
-        ("Unanswered (est.)", q_summary.get("unanswered", 0)),
-        ("Unique students (est.)", q_summary.get("unique_students_est", 0)),
-    ]
-
-
-def _format_qna_summary_text(q_summary: Dict[str, Any]) -> str:
-    return " | ".join(f"{label}: {value}" for label, value in _qna_summary_pairs(q_summary))
-
-
-def _format_qna_summary_html(q_summary: Dict[str, Any]) -> str:
-    return "<br/>".join(f"<strong>{label}:</strong> {value}" for label, value in _qna_summary_pairs(q_summary))
-
-
-def _markdown_to_html(text: str) -> str:
-    """Convert markdown text to HTML for email formatting."""
-    if markdown is None:
-        # Fallback: basic conversion if markdown library not available
-        # Convert **bold** to <strong>bold</strong>
-        text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
-        # Convert * to • for bullets (basic)
-        text = re.sub(r'^\* (.+)$', r'• \1', text, flags=re.MULTILINE)
-        # Convert numbered lists
-        text = re.sub(r'^\d+\. (.+)$', r'• \1', text, flags=re.MULTILINE)
-        # Convert headers
-        text = re.sub(r'^### (.+)$', r'<h4>\1</h4>', text, flags=re.MULTILINE)
-        text = re.sub(r'^## (.+)$', r'<h3>\1</h3>', text, flags=re.MULTILINE)
-        text = re.sub(r'^# (.+)$', r'<h2>\1</h2>', text, flags=re.MULTILINE)
-        return text.replace('\n', '<br>')
-    else:
-        # Use proper markdown conversion
-        html = markdown.markdown(text, extensions=['extra'])
-        # Add some basic styling
-        html = html.replace('<h1>', '<h1 style="color:#2c3e50;margin-top:20px;">')
-        html = html.replace('<h2>', '<h2 style="color:#34495e;margin-top:18px;">')
-        html = html.replace('<h3>', '<h3 style="color:#7f8c8d;margin-top:16px;">')
-        html = html.replace('<h4>', '<h4 style="color:#95a5a6;margin-top:14px;">')
-        html = html.replace('<ul>', '<ul style="margin:10px 0;padding-left:20px;">')
-        html = html.replace('<ol>', '<ol style="margin:10px 0;padding-left:20px;">')
-        html = html.replace('<li>', '<li style="margin:5px 0;">')
-        html = html.replace('<p>', '<p style="margin:10px 0;line-height:1.5;">')
-        html = html.replace('<strong>', '<strong style="font-weight:bold;">')
-        html = html.replace('<em>', '<em style="font-style:italic;">')
-        return html
-
-
-def _format_qna_details(qna_rows: List[List[Any]], limit: int = 20) -> Tuple[str, str]:
-    text_lines: List[str] = []
-    html_items: List[str] = []
-    total = len(qna_rows or [])
-    rows = qna_rows or []
-    for idx, row in enumerate(rows):
-        if idx >= limit:
-            remaining = total - limit
-            text_lines.append(f"... ({remaining} more)")
-            html_items.append(f"<li>... ({remaining} more)</li>")
-            break
-        start_ts = _mmss(row[0] if len(row) > 0 else 0.0)
-        student_id = row[2] if len(row) > 2 else "—"
-        answered_flag = bool(row[3]) if len(row) > 3 else False
-        question = row[4] if len(row) > 4 else ""
-        answered_text = "answered" if answered_flag else "pending"
-        text_lines.append(f"{start_ts} · {student_id} · {answered_text.upper()} · {question}")
-        html_items.append(
-            f"<li><strong>{start_ts}</strong> · {student_id} · {answered_text.title()} · {question}</li>"
-        )
-    if not text_lines:
-        text_lines.append("No Q&A items detected.")
-        html_items.append("<li>No Q&A items detected.</li>")
-    return "\n".join(text_lines), "<ul>" + "".join(html_items) + "</ul>"
-
-
-def send_model_feedback_email(model_key: str, recipients_text: str, state: Dict[str, Any]) -> str:
-    if not APP_EMAIL_ENABLED:
-        raise gr.Error("Email sending is disabled on this server.")
-    if not state or not state.get("feedback_map"):
-        raise gr.Error("Run Generate Feedback first to load model responses.")
-
-    feedback_map = state.get("feedback_map") or {}
-    feedback_text = (feedback_map.get(model_key) or "").strip()
-    model_label = MODEL_DISPLAY_NAMES.get(model_key, model_key)
-    if not feedback_text:
-        raise gr.Error(f"No {model_label} feedback available yet.")
-
-    recipients = _parse_recipient_list(recipients_text) or APP_EMAIL_RECIPIENTS
-    if not recipients:
-        raise gr.Error("Provide at least one recipient email.")
-
-    q_summary = state.get("qna_summary") or {}
-    qna_rows = state.get("qna_rows") or []
-
-    summary_text = _format_qna_summary_text(q_summary)
-    summary_html = _format_qna_summary_html(q_summary)
-    detail_text, detail_html = _format_qna_details(qna_rows, limit=25)
-
-    file_id = state.get("file_id") or "lecture"
-    subject = f"{model_label} feedback report — {file_id}"
-    # Format text body with better spacing and structure
-    text_body = (
-        f"{'='*50}\n"
-        f"{model_label.upper()} FEEDBACK REPORT\n"
-        f"{'='*50}\n\n"
-        f"FEEDBACK CONTENT:\n"
-        f"{'-'*20}\n"
-        f"{feedback_text}\n\n"
-        f"{'='*30}\n"
-        f"Q&A SUMMARY:\n"
-        f"{'-'*15}\n"
-        f"{summary_text or 'No Q&A summary available.'}\n\n"
-        f"{'='*30}\n"
-        f"Q&A ITEMS:\n"
-        f"{'-'*12}\n"
-        f"{detail_text}\n"
-        f"{'='*50}\n"
-        f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    # Convert markdown feedback to HTML for better email formatting
-    feedback_html = _markdown_to_html(feedback_text)
-
-    html_body = (
-        f"<h2 style='color:#2c3e50;border-bottom:2px solid #3498db;padding-bottom:10px;'>{model_label} Feedback</h2>"
-        f"<div style='background:#f8f9fa;padding:15px;border-radius:5px;margin:10px 0;'>"
-        f"{feedback_html}"
-        f"</div>"
-        "<h3 style='color:#34495e;margin-top:20px;'>Q&amp;A Summary</h3>"
-        f"<div style='background:#ecf0f1;padding:10px;border-radius:3px;margin:10px 0;'>"
-        f"{summary_html or 'No Q&amp;A summary available.'}"
-        f"</div>"
-        "<h3 style='color:#34495e;margin-top:20px;'>Q&amp;A Items</h3>"
-        f"<div style='background:#ecf0f1;padding:10px;border-radius:3px;margin:10px 0;'>"
-        f"{detail_html}"
-        f"</div>"
-    )
-
-    try:
-        send_report_to_recipients(recipients, subject, text_body, html_body)
-    except Exception as e:
-        raise gr.Error(f"Failed to send email: {e}") from e
-
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return f"✅ Sent {model_label} feedback to {', '.join(recipients)} at {ts}."
-
 # ===================== ADAPTIVE WEIGHTING (NEW) =====================
 
 WEIGHTS_FILE = os.environ.get("MODEL_WEIGHTS_FILE", str(BASE_DIR / "model_weights.json"))
@@ -1115,13 +936,22 @@ def ranking_md(weights_store: Dict[str, Any], available_models: List[str]) -> st
         wt = effective_weight(weights_store, k)
         rows.append((k, wt, up, down, _provider_for_model(k), _base_weight(k)))
     rows.sort(key=lambda r: r[1], reverse=True)
+    name_map = {
+        "openai": "OpenAI · GPT",
+        "gemini": "Google · Gemini",
+        "groq": "Groq (GPT-OSS-120B)",
+        "scout": "Groq (Llama-4-Scout)",
+        "ollama": "Ollama (local)",
+        "or_deepseek_r1d_70b": "OpenRouter · DeepSeek R1D 70B",
+        "or_gemma2_9b_it": "OpenRouter · Gemma2-9B-IT",
+    }
     lines = ["**Model Ranking (higher is preferred)**",
              "",
              "| Rank | Model | Provider | Base | Bonus(votes) | Up | Down | Eff. Weight |",
              "|---:|---|---|---:|---:|---:|---:|---:|"]
     for i, (k, wt, up, down, prov, base) in enumerate(rows, 1):
         bonus = wt - base
-        label = MODEL_DISPLAY_NAMES.get(k, k)
+        label = name_map.get(k, k)
         lines.append(f"| {i} | {label} | {prov} | {base:.2f} | {bonus:+.2f} | {up} | {down} | {wt:.2f} |")
     return "\n".join(lines)
 
@@ -1201,10 +1031,10 @@ def pack_outputs(
     seg_rows: List[List[Any]],
     primary_text: str,
     engine_note: str,
-    fb_groq: str,
-    fb_scout: str,
     fb_openai: str,
     fb_gemini: str,
+    fb_groq: str,
+    fb_scout: str,
     fb_ollama: str,
     fb_or_deepseek: str,
     fb_or_gemma: str,
@@ -1216,20 +1046,17 @@ def pack_outputs(
     vote_dd_update,
     raw_json: str,
     state_dict: Dict[str, Any],
-    email_status_map: Optional[Dict[str, str]] = None,
 ):
-    status_map = email_status_map or {}
-    additional_models = gr.update(value=fb_ollama or "", visible=bool(fb_ollama))
     return (
         transcript_text or "",
         seg_rows or [],
         primary_text or "",
         engine_note or "",
-        fb_groq or "",
-        fb_scout or "",
         fb_openai or "",
         fb_gemini or "",
-        additional_models,
+        fb_groq or "",
+        fb_scout or "",
+        fb_ollama or "",
         fb_or_deepseek or "",
         fb_or_gemma or "",
         qna_md or "",
@@ -1240,7 +1067,6 @@ def pack_outputs(
         vote_dd_update if vote_dd_update is not None else gr.update(),
         raw_json or "{}",
         state_dict or {},
-        *(status_map.get(key, "") for key in MODEL_EMAIL_SECTION_KEYS),
     )
 
 
@@ -1248,7 +1074,6 @@ def transcribe_stream(
     src_file: Optional[str],
     video_url: Optional[str],
     mic_audio: Optional[str],
-    video_input: Optional[str],
     language_hint: str,
     initial_prompt: str,
     translate_to_en: bool,
@@ -1258,56 +1083,29 @@ def transcribe_stream(
 
     src_file = _normalize_uploaded(src_file)
     mic_audio = _normalize_uploaded(mic_audio)
-    video_input = _normalize_uploaded(video_input)
     chosen: Optional[Path] = None
 
-    # Handle different input sources with priority
-    file_id = uuid.uuid4().hex
-    dst_media = None
-
     if src_file and Path(src_file).exists():
-        # Uploaded file
-        src_path = Path(src_file)
-        dst_media = WORK_DIR / f"{file_id}{src_path.suffix.lower()}"
-        shutil.copy2(src_path, dst_media)
-
-    elif video_input and Path(video_input).exists():
-        # Webcam video recording
-        src_path = Path(video_input)
-        dst_media = WORK_DIR / f"{file_id}{src_path.suffix.lower()}"
-        shutil.copy2(src_path, dst_media)
-
+        chosen = Path(src_file)
     elif mic_audio and Path(mic_audio).exists():
-        # Microphone audio recording
-        src_path = Path(mic_audio)
-        dst_media = WORK_DIR / f"{file_id}{src_path.suffix.lower()}"
-        shutil.copy2(src_path, dst_media)
-
+        chosen = Path(mic_audio)
     elif _is_http_url(video_url):
-        # Video URL
-        dst_media = _download_media_from_url(video_url.strip(), WORK_DIR)
-        # Rename to include file_id
-        if dst_media and dst_media.exists():
-            new_dst = WORK_DIR / f"{file_id}{dst_media.suffix.lower()}"
-            dst_media.rename(new_dst)
-            dst_media = new_dst
+        chosen = _download_media_from_url(video_url.strip(), WORK_DIR)
 
-    if not dst_media or not dst_media.exists():
-        # Debug: check what inputs we received
-        debug_info = []
-        if src_file:
-            debug_info.append(f"src_file: {src_file} (exists: {Path(src_file).exists() if src_file else False})")
-        if video_input:
-            debug_info.append(f"video_input: {video_input} (exists: {Path(video_input).exists() if video_input else False})")
-        if mic_audio:
-            debug_info.append(f"mic_audio: {mic_audio} (exists: {Path(mic_audio).exists() if mic_audio else False})")
-        if video_url:
-            debug_info.append(f"video_url: {video_url}")
+    if not chosen:
+        raise gr.Error("No valid media provided (upload a file or paste a URL).")
 
-        debug_msg = "Debug info: " + "; ".join(debug_info) if debug_info else "No inputs provided"
-        raise gr.Error(f"No valid media provided (upload a file or paste a URL). {debug_msg}")
-
-    chosen = dst_media
+    file_id = uuid.uuid4().hex
+    dst_media = WORK_DIR / f"{file_id}{chosen.suffix.lower()}"
+    for _ in range(20):
+        try:
+            with open(chosen, "rb") as r, open(dst_media, "wb") as w:
+                shutil.copyfileobj(r, w, 1024 * 1024)
+            break
+        except PermissionError:
+            time.sleep(0.25)
+    else:
+        raise gr.Error("Could not read the file (Windows locked it).")
 
     progress(0.05, desc="Extracting audio…")
     wav = ensure_wav(dst_media)
@@ -1552,32 +1350,16 @@ def generate_feedback(
     state["mongo_feedback_saved"] = bool(mongo_id)
     state["mongo_feedback_id"] = mongo_id
 
-    extra_sections: List[str] = []
-    ordered_for_display = ordered_keys or list(fb_map.keys())
-    for key in ordered_for_display:
-        if key in MODEL_EMAIL_SECTION_SET:
-            continue
-        text = fb_map.get(key)
-        if text:
-            extra_sections.append(f"### {MODEL_DISPLAY_NAMES.get(key, key)}\n{text}")
-    if not extra_sections:
-        for key, text in fb_map.items():
-            if key in MODEL_EMAIL_SECTION_SET:
-                continue
-            if text:
-                extra_sections.append(f"### {MODEL_DISPLAY_NAMES.get(key, key)}\n{text}")
-    extras_md = "\n\n".join(extra_sections)
-
     return pack_outputs(
         transcript_text=state.get("transcript_text", ""),
         seg_rows=seg_rows,
         primary_text=primary,
         engine_note=f"*Feedback engines (ordered):* {ordered_keys}",
-        fb_groq=fb_map.get("groq", ""),
-        fb_scout=fb_map.get("scout", ""),
         fb_openai=fb_map.get("openai", ""),
         fb_gemini=fb_map.get("gemini", ""),
-        fb_ollama=extras_md,
+        fb_groq=fb_map.get("groq", ""),
+        fb_scout=fb_map.get("scout", ""),
+        fb_ollama=fb_map.get("ollama", ""),
         fb_or_deepseek=fb_map.get("or_deepseek_r1d_70b", ""),
         fb_or_gemma=fb_map.get("or_gemma2_9b_it", ""),
         qna_md=qna_md,
@@ -1927,10 +1709,9 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
             )
             inp = gr.File(label="Upload lecture video/audio", file_types=["video", "audio"], type="filepath")
             mic_input = gr.Audio(label="Record audio with microphone", sources=["microphone"], type="filepath")
-            video_input = gr.Video(label="Record video with webcam", sources=["webcam"], format="mp4", include_audio=True)
             with gr.Row():
-             lang = gr.Dropdown(LANG_OPTIONS, value="auto", label="Language (hint)")
-            translate_toggle = gr.Checkbox(
+            lang = gr.Dropdown(LANG_OPTIONS, value="auto", label="Language (hint)")
+                translate_toggle = gr.Checkbox(
                     label="Translate non-English → English",
                     value=TRANSLATE_DEFAULT,
                 )
@@ -1964,7 +1745,7 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
     st = gr.State({})
 
     with gr.Tabs():
-     with gr.Tab("Transcript"):
+    with gr.Tab("Transcript"):
         transcript_box = gr.Textbox(label="Transcript", lines=12)
 
     with gr.Tab("Segments"):
@@ -1976,60 +1757,15 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
         )
 
     with gr.Tab("Teaching Feedback"):
-        gr.Markdown("### Teaching Feedback Overview")
-        feedback_primary_box = gr.Markdown()
+        feedback_primary_box = gr.Markdown(label="Primary feedback")
         engine_md = gr.Markdown()
-        email_recipient_tb = gr.Textbox(
-            label="Email recipients (optional)",
-            placeholder="teacher@example.com, mentor@example.com",
-            lines=1,
-        )
-        gr.Markdown(
-            "Leave the recipient box empty to use the default mailing list. "
-            "Each model section below includes a button to send its feedback plus the captured Q&A summary."
-        )
-
-        with gr.Accordion(MODEL_DISPLAY_NAMES["groq"], open=False):
-            fb_groq = gr.Markdown()
-            with gr.Row():
-                send_groq_btn = gr.Button("Send Groq feedback to email", variant="primary")
-            groq_email_status = gr.Markdown()
-
-        with gr.Accordion(MODEL_DISPLAY_NAMES["scout"], open=False):
-            fb_scout = gr.Markdown()
-            with gr.Row():
-                send_scout_btn = gr.Button("Send Scout feedback to email", variant="primary")
-            scout_email_status = gr.Markdown()
-
-        with gr.Accordion(MODEL_DISPLAY_NAMES["openai"], open=False):
-            fb_openai = gr.Markdown()
-            with gr.Row():
-                send_openai_btn = gr.Button("Send OpenAI feedback to email", variant="primary")
-            openai_email_status = gr.Markdown()
-
-        with gr.Accordion(MODEL_DISPLAY_NAMES["gemini"], open=False):
-            fb_gemini = gr.Markdown()
-            with gr.Row():
-                send_gemini_btn = gr.Button("Send Gemini feedback to email", variant="primary")
-            gemini_email_status = gr.Markdown()
-
-        with gr.Accordion(MODEL_DISPLAY_NAMES["or_deepseek_r1d_70b"], open=False):
-            fb_or_deepseek = gr.Markdown()
-            with gr.Row():
-                send_deepseek_btn = gr.Button("Send DeepSeek feedback to email", variant="primary")
-            deepseek_email_status = gr.Markdown()
-
-        with gr.Accordion(MODEL_DISPLAY_NAMES["or_gemma2_9b_it"], open=False):
-            fb_or_gemma = gr.Markdown()
-            with gr.Row():
-                send_gemma_btn = gr.Button("Send Gemma feedback to email", variant="primary")
-            gemma_email_status = gr.Markdown()
-
-        gr.Markdown("#### Additional models (auto)")
-        gr.Markdown(
-            "When you run `All (compare)`, any extra model outputs (for example, Local Ollama) will appear below."
-        )
-        fb_ollama = gr.Markdown(visible=False)
+        fb_openai = gr.Markdown(label="OpenAI")
+        fb_gemini = gr.Markdown(label="Gemini")
+        fb_groq = gr.Markdown(label="Groq")
+        fb_scout = gr.Markdown(label="Scout")
+            fb_ollama = gr.Markdown(label="Ollama")
+        fb_or_deepseek = gr.Markdown(label="OpenRouter DeepSeek")
+        fb_or_gemma = gr.Markdown(label="OpenRouter Gemma")
 
     with gr.Tab("Q&A Stats"):
         qna_summary_md = gr.Markdown()
@@ -2047,8 +1783,8 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
     with gr.Tab("Model Ranking & Votes"):
         ranking_md_box = gr.Markdown(value="Run feedback to see ranking…")
         vote_model_dd = gr.Dropdown(choices=[], label="Model to vote", interactive=True)
-        with gr.Row():
-         up_btn = gr.Button("👍 Thumbs Up", variant="primary")
+            with gr.Row():
+        up_btn = gr.Button("👍 Thumbs Up", variant="primary")
         down_btn = gr.Button("👎 Thumbs Down", variant="secondary")
         vote_result_md = gr.Markdown()
 
@@ -2060,10 +1796,10 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
         segtbl,
         feedback_primary_box,
         engine_md,
-        fb_groq,
-        fb_scout,
         fb_openai,
         fb_gemini,
+        fb_groq,
+        fb_scout,
         fb_ollama,
         fb_or_deepseek,
         fb_or_gemma,
@@ -2075,48 +1811,11 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
         vote_model_dd,
         rawjson_box,
         st,
-        groq_email_status,
-        scout_email_status,
-        openai_email_status,
-        gemini_email_status,
-        deepseek_email_status,
-        gemma_email_status,
     ]
-
-    send_groq_btn.click(
-        lambda recipients, s: send_model_feedback_email("groq", recipients, s),
-        inputs=[email_recipient_tb, st],
-        outputs=[groq_email_status],
-    )
-    send_scout_btn.click(
-        lambda recipients, s: send_model_feedback_email("scout", recipients, s),
-        inputs=[email_recipient_tb, st],
-        outputs=[scout_email_status],
-    )
-    send_openai_btn.click(
-        lambda recipients, s: send_model_feedback_email("openai", recipients, s),
-        inputs=[email_recipient_tb, st],
-        outputs=[openai_email_status],
-    )
-    send_gemini_btn.click(
-        lambda recipients, s: send_model_feedback_email("gemini", recipients, s),
-        inputs=[email_recipient_tb, st],
-        outputs=[gemini_email_status],
-    )
-    send_deepseek_btn.click(
-        lambda recipients, s: send_model_feedback_email("or_deepseek_r1d_70b", recipients, s),
-        inputs=[email_recipient_tb, st],
-        outputs=[deepseek_email_status],
-    )
-    send_gemma_btn.click(
-        lambda recipients, s: send_model_feedback_email("or_gemma2_9b_it", recipients, s),
-        inputs=[email_recipient_tb, st],
-        outputs=[gemma_email_status],
-    )
 
     btn_transcribe.click(
         transcribe_stream,
-        inputs=[inp, video_url_tb, mic_input, video_input, lang, iprompt, translate_toggle],
+        inputs=[inp, video_url_tb, mic_input, lang, iprompt, translate_toggle],
         outputs=outputs,
         api_name=False,
         show_api=False,
@@ -2165,7 +1864,7 @@ if __name__ == "__main__":
     share_flag = bool(int(os.getenv("GRADIO_SHARE", "0")))
     host = os.getenv("GRADIO_HOST", "127.0.0.1")
     try:
-     demo.queue(max_size=4).launch(
+    demo.queue(max_size=4).launch(
         show_api=False,
         share=share_flag,
         server_name=host,
