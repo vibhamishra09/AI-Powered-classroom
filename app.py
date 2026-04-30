@@ -6,16 +6,24 @@ import time
 import shutil
 import subprocess
 import smtplib
+import tempfile
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
+import math
 
 import requests
 import gradio as gr
+import uvicorn
 from faster_whisper import WhisperModel
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 try:
     import markdown
@@ -29,7 +37,8 @@ except Exception:
     OpenAI = None
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
 except Exception:
     genai = None
 
@@ -151,7 +160,7 @@ def store_teaching_result(
         "created_at": datetime.utcnow(),
     }
     try:
-        client = MongoClient(uri, serverSelectionTimeoutMS=4000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=1000)
         result = client[db_name][coll_name].insert_one(doc)
         return str(getattr(result, "inserted_id", None))
     except Exception as e:
@@ -159,7 +168,8 @@ def store_teaching_result(
         return None
     finally:
         try:
-            client.close()
+            if 'client' in locals():
+                client.close()
         except Exception:
             pass
 
@@ -210,7 +220,7 @@ OPENAI_TEMP       = float(os.getenv("OPENAI_TEMP", "0.2"))
 
 # ===================== Gemini ENV =====================
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_TEMP        = float(os.getenv("GEMINI_TEMP", "0.2"))
 GEMINI_MAX_TOKENS  = int(os.getenv("GEMINI_MAX_TOKENS", "1200"))
 GEMINI_CHUNK_CHARS = int(os.getenv("GEMINI_CHUNK_CHARS", "7000"))
@@ -250,6 +260,7 @@ model = WhisperModel(
     WHISPER_SIZE,
     device="auto",
     compute_type=COMPUTE_TYPE,
+    cpu_threads=int(os.getenv("WHISPER_CPU_THREADS", "4")),
     download_root=str(WORK_DIR / "models"),
 )
 
@@ -318,6 +329,32 @@ def segment_wav(wav_path: Path, chunk_sec: int) -> List[Path]:
     Convenience wrapper so streaming flow can re-use the existing segmentation logic.
     """
     return segment_media_to_wavs(wav_path, chunk_sec)
+
+
+def extract_wav_slice(src_media: Path, start_sec: float, duration_sec: float, out_wav: Path) -> Path:
+    """
+    Extract one audio slice as 16k mono WAV so we can stream chunk 1 without
+    waiting for full-media extraction/segmentation.
+    """
+    ffm = _which("ffmpeg")
+    if not ffm:
+        raise FileNotFoundError("ffmpeg not found")
+    if not _has_audio_stream(src_media):
+        raise RuntimeError(f"No audio stream found in file: {src_media}")
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffm, "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", str(max(0.0, float(start_sec))),
+        "-i", str(src_media),
+        "-t", str(max(0.1, float(duration_sec))),
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+        str(out_wav),
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if res.returncode != 0 or (not out_wav.exists()) or out_wav.stat().st_size == 0:
+        err = (res.stderr or b"").decode(errors="ignore")[:800]
+        raise RuntimeError(f"Slice extraction failed: {err}")
+    return out_wav
 
 
 def transcribe_wav_iter(
@@ -479,22 +516,37 @@ def _download_media_from_url(url: str, dest_dir: Path) -> Path:
     outtmpl = str(dest_dir / f"{file_id}.%(ext)s")
     ydl_opts = {
         "outtmpl": outtmpl,
-        "format": "bv*+ba/b",
+        # Prefer 480p or lower for much faster downloads while remaining useful for analysis
+        "format": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
         "merge_output_format": "mp4",
+        "noplaylist": True,
+        "concurrent_fragment_downloads": 5,
+        "force_ipv4": True,
+        "geo_bypass": True,
+        "nocheckcertificate": True,
+        "socket_timeout": 15,
+        "sleep_interval": 0,
+        "max_sleep_interval": 0,
         "quiet": True,
         "noprogress": True,
+        "no_warnings": True,
+        "js_runtimes": {"node": {}},
     }
+    cookies_path = BASE_DIR / "secrets" / "youtube_cookies.txt"
+    if cookies_path.exists():
+        ydl_opts["cookiefile"] = str(cookies_path)
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-    files = list(dest_dir.glob(f"{file_id}.*"))
-    if not files:
-        guess = Path(ydl.prepare_filename(info))
-        if guess.exists():
-            return guess
-        raise gr.Error("Download succeeded but cannot find the output file.")
-    return files[0]
-
-# ===================== Long-media segmentation =====================
+        try:
+            info = ydl.extract_info(url, download=True)
+            files = list(dest_dir.glob(f"{file_id}.*"))
+            if not files:
+                guess = Path(ydl.prepare_filename(info))
+                if guess.exists():
+                    return guess
+                raise gr.Error("Download succeeded but cannot find the output file.")
+            return files[0]
+        except Exception as e:
+            raise gr.Error(f"Download failed: {str(e)}")
 
 # ===================== Long-media segmentation =====================
 def segment_media_to_wavs(src_media: Path, chunk_sec: int = CHUNK_SEC) -> List[Path]:
@@ -526,7 +578,7 @@ def segment_media_to_wavs(src_media: Path, chunk_sec: int = CHUNK_SEC) -> List[P
     return parts
 
 # ===================== Prompt builder for feedback =====================
-def _build_feedback_prompt(transcript_text: str, segments: List[dict]) -> Tuple[str, str]:
+def _build_feedback_prompt(transcript_text: str, segments: List[dict], visual_data: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
     t_snip = _trim_middle(transcript_text or "", PROMPT_TRANSCRIPT_CHARS)
     lines = []
     for s in segments[:60]:
@@ -536,6 +588,8 @@ def _build_feedback_prompt(transcript_text: str, segments: List[dict]) -> Tuple[
 
     system_msg = (
         "You are “TeachCoach”. Only pedagogy-improvement advice (no audio/production; no praise). "
+        "Analyze both the transcript and any visual engagement data provided. "
+        "Pay special attention to whether student questions (indicated by hand raises or verbal cues) were addressed. "
         "Detect topics; then produce:\n"
         "0) Detected Topics (bullets)\n"
         "1) Top 5 Improvements (fix + why + how)\n"
@@ -546,6 +600,22 @@ def _build_feedback_prompt(transcript_text: str, segments: List[dict]) -> Tuple[
         "Be concrete with timestamps. Return markdown only."
     )
     user_msg = f"Transcript (truncated):\n{t_snip}\n\nSegments:\n" + "\n".join(lines)
+    
+    if visual_data:
+        hand_events = visual_data.get("hand_raise_events", [])
+        if hand_events:
+            summary = "\n\nVisual Analysis (Student Engagement/Hand Raises):\n"
+            # Summarize total unique or major clusters
+            total_hands = visual_data.get("hand_raise_unique", 0) or len(hand_events)
+            summary += f"- Estimated {total_hands} hand-raise events detected.\n"
+            for ev in hand_events[:15]:
+                summary += f"  * {_mmss(ev['t'])}: {ev['count']} hand(s)\n"
+            user_msg += summary
+        
+        board_text = visual_data.get("board_text", "")
+        if board_text:
+            user_msg += f"\n\nBoard Content (OCR snippet):\n{board_text[:1000]}"
+
     return system_msg, user_msg
 
 # ===================== Whisper transcription =====================
@@ -622,30 +692,22 @@ def transcribe_short(wav_path: Path, language_hint: Optional[str], initial_promp
     return segments, " ".join(full_text), duration
 
 # ===================== Provider feedbacks =====================
-def openrouter_feedback_model(transcript_text: str, segments: List[dict], model_id: str) -> str:
-    api_key = OPENROUTER_API_KEY
-    if not api_key:
-        raise RuntimeError("Set OPENROUTER_API_KEY env var")
-
-    system_msg, user_msg = _build_feedback_prompt(transcript_text, segments)
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "X-Title": "Lecture Analyzer",
-    }
+def openrouter_feedback_model(transcript_text: str, segments: List[dict], model_id: str, visual_data: Optional[Dict[str, Any]] = None) -> str:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("Set OPENROUTER_API_KEY")
+    sys, usr = _build_feedback_prompt(transcript_text, segments, visual_data)
     payload = {
         "model": model_id,
         "messages": [
-            {"role":"system","content":system_msg},
-            {"role":"user","content":user_msg}
+            {"role": "system", "content": sys},
+            {"role": "user", "content": usr},
         ],
         "temperature": 0.2,
         "max_tokens": 900,
         "stream": False,
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=PROVIDER_TIMEOUT)
+    r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+                      headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "X-Title": "Lecture Analyzer"}, json=payload, timeout=PROVIDER_TIMEOUT)
     r.raise_for_status()
     j = r.json()
     text = ((j.get("choices") or [{}])[0].get("message") or {}).get("content"," ").strip()
@@ -653,14 +715,14 @@ def openrouter_feedback_model(transcript_text: str, segments: List[dict], model_
         raise RuntimeError(f"OpenRouter empty response: {j}")
     return text
 
-def ollama_feedback(transcript_text: str, segments: List[dict]) -> str:
+def ollama_feedback(transcript_text: str, segments: List[dict], visual_data: Optional[Dict[str, Any]] = None) -> str:
     _ollama_probe_or_raise()
     base       = _ollama_base_url()
-    model_id   = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+    model_id   = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b-instruct")
     temp       = float(os.getenv("OLLAMA_TEMP", "0.0"))
-    num_ctx    = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+    num_ctx    = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
     num_predict= int(os.getenv("OLLAMA_NUM_PREDICT", "800"))
-    timeout    = int(os.getenv("OLLAMA_TIMEOUT", "600"))
+    timeout    = int(os.getenv("OLLAMA_TIMEOUT", "900"))
 
     t_snip = _trim_middle(transcript_text or "", PROMPT_TRANSCRIPT_CHARS)
     lines = []
@@ -671,9 +733,15 @@ def ollama_feedback(transcript_text: str, segments: List[dict]) -> str:
 
     system_msg = (
         "You are “TeachCoach”… (pedagogy advice only). "
+        "Analyze transcript and any visual data (hand raises) provided. "
         "0) Topics  1) Top 5 Improvements  2) (mm:ss)→fix  3) Examples  4) Questions(4)  5) Next-Class Plan(10)."
     )
     user_msg = f"Transcript (truncated):\n{t_snip}\n\nSegments:\n" + "\n".join(lines)
+    if visual_data:
+        evs = visual_data.get("hand_raise_events", [])
+        if evs:
+            user_msg += f"\n\nVisuals: {len(evs)} hand raise events detected."
+    
     merged = f"[SYSTEM]\n{system_msg}\n[/SYSTEM]\n[USER]\n{user_msg}\n[/USER]\n"
 
     payload = {
@@ -710,90 +778,110 @@ def make_groq():
     except TypeError:
         return Groq(api_key=api_key)
 
-def groq_feedback(transcript_text: str, segments: List[dict]) -> str:
-    if Groq is None:
-        raise RuntimeError("groq SDK not installed. Run: pip install groq")
+def groq_feedback(transcript_text: str, segments: List[dict], visual_data: Optional[Dict[str, Any]] = None) -> str:
     if not GROQ_API_KEY:
-        raise RuntimeError("Set GROQ_API_KEY env var")
-    client = make_groq()
-    system_msg, user_msg = _build_feedback_prompt(transcript_text, segments)
-    resp = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role":"system","content":system_msg},{"role":"user","content":user_msg}],
-        temperature=GROQ_TEMP,
-        max_tokens=GROQ_MAX_TOKENS,
-        stream=False,
-    )
-    text = (resp.choices[0].message.content or "").strip()
-    if not text:
-        raise RuntimeError("Groq returned empty text")
-    return text
+        raise RuntimeError("Set GROQ_API_KEY")
+    sys, usr = _build_feedback_prompt(transcript_text, segments, visual_data)
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": usr},
+        ],
+        "temperature": GROQ_TEMP,
+        "max_tokens": GROQ_MAX_TOKENS,
+    }
+    r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                      headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, json=payload, timeout=60)
+    r.raise_for_status()
+    return (r.json()["choices"][0]["message"]["content"] or "").strip()
 
-def groq_scout_feedback(transcript_text: str, segments: List[dict]) -> str:
-    if Groq is None:
-        raise RuntimeError("groq SDK not installed. Run: pip install groq")
+def groq_scout_feedback(transcript_text: str, segments: List[dict], visual_data: Optional[Dict[str, Any]] = None) -> str:
     if not GROQ_API_KEY:
-        raise RuntimeError("Set GROQ_API_KEY env var")
-    client = make_groq()
-    system_msg, user_msg = _build_feedback_prompt(transcript_text, segments)
-    resp = client.chat.completions.create(
-        model=GROQ_SCOUT_MODEL,
-        messages=[{"role":"system","content":system_msg},{"role":"user","content":user_msg}],
-        temperature=GROQ_SCOUT_TEMP,
-        max_tokens=GROQ_SCOUT_MAX_TOKENS,
-        stream=False,
-    )
-    text = (resp.choices[0].message.content or "").strip()
-    if not text:
-        raise RuntimeError("Groq (Llama-4-Scout) returned empty text")
-    return text
+        raise RuntimeError("Set GROQ_API_KEY")
+    sys, usr = _build_feedback_prompt(transcript_text, segments, visual_data)
+    payload = {
+        "model": GROQ_SCOUT_MODEL,
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": usr},
+        ],
+        "temperature": GROQ_SCOUT_TEMP,
+        "max_tokens": GROQ_SCOUT_MAX_TOKENS,
+    }
+    r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                      headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, json=payload, timeout=60)
+    r.raise_for_status()
+    return (r.json()["choices"][0]["message"]["content"] or "").strip()
 
 # NEW: OpenAI feedback
-def openai_feedback(transcript_text: str, segments: List[dict]) -> str:
-    if OpenAI is None:
-        raise RuntimeError("openai SDK not installed. Run: pip install openai")
+def openai_feedback(transcript_text: str, segments: List[dict], visual_data: Optional[Dict[str, Any]] = None) -> str:
     if not OPENAI_API_KEY:
-        raise RuntimeError("Set OPENAI_API_KEY env var")
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    system_msg, user_msg = _build_feedback_prompt(transcript_text, segments)
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":system_msg},{"role":"user","content":user_msg}],
-        temperature=OPENAI_TEMP,
-        max_tokens=OPENAI_MAX_TOKENS,
-    )
-    text = (resp.choices[0].message.content or "").strip()
+        raise RuntimeError("Set OPENAI_API_KEY")
+    sys_msg, usr_msg = _build_feedback_prompt(transcript_text, segments, visual_data)
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": usr_msg},
+        ],
+        "temperature": 0.2,
+    }
+    r = requests.post("https://api.openai.com/v1/chat/completions",
+                      headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, json=payload, timeout=60)
+    r.raise_for_status()
+    text = (r.json()["choices"][0]["message"]["content"] or "").strip()
     if not text:
         raise RuntimeError("OpenAI returned empty text")
     return text
 
-# UPDATED: Gemini feedback (map-reduce for long transcripts)
-def gemini_feedback(transcript_text: str, segments: list[dict]) -> str:
+# UPDATED: Gemini feedback (map-reduce for long transcripts with parallel chunking)
+def gemini_feedback(transcript_text: str, segments: list[dict], visual_data: Optional[Dict[str, Any]] = None) -> str:
     if genai is None:
-        raise RuntimeError("google-generativeai SDK not installed. Run: pip install google-generativeai")
+        raise RuntimeError("google-genai SDK not installed. Run: pip install google-genai")
     if not GEMINI_API_KEY:
         raise RuntimeError("Set GEMINI_API_KEY")
-    genai.configure(api_key=GEMINI_API_KEY)
-    model_g = genai.GenerativeModel(GEMINI_MODEL)
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
-    system_msg, user_msg = _build_feedback_prompt(transcript_text, segments)
+    system_msg, user_msg = _build_feedback_prompt(transcript_text, segments, visual_data)
     parts = _chunk_text(user_msg, GEMINI_CHUNK_CHARS, GEMINI_OVERLAP)
-    partials: list[str] = []
-    for i, ch in enumerate(parts, 1):
-        resp = model_g.generate_content(
-            [{"text": system_msg},{"text": f"(Part {i} of {len(parts)})\n{ch}"}],
-            generation_config={"temperature": GEMINI_TEMP, "max_output_tokens": GEMINI_MAX_TOKENS},
-        )
-        partials.append((getattr(resp, "text", None) or "").strip())
+    
+    config = types.GenerateContentConfig(
+        system_instruction=system_msg,
+        temperature=GEMINI_TEMP,
+        max_output_tokens=GEMINI_MAX_TOKENS,
+    )
+
+    def process_chunk(idx, ch):
+        prompt = f"(Part {idx} of {len(parts)})\n{ch}"
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=config,
+            )
+            return (getattr(resp, "text", None) or "").strip()
+        except Exception as e:
+            return f"[Chunk {idx} failed: {e}]"
+
+    if len(parts) > 1:
+        with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+            results = list(pool.map(lambda p: process_chunk(p[0]+1, p[1]), enumerate(parts)))
+        partials = results
+    else:
+        partials = [process_chunk(1, parts[0])] if parts else []
+
+    if len(partials) == 0:
+        return "*No feedback generated.*"
     if len(partials) == 1:
         return partials[0]
-    resp = model_g.generate_content(
-        [
-            {"text": "Combine and deduplicate the partial analyses below into ONE cohesive report, "
-                      "strictly following the same 'TeachCoach' rubric with timestamps kept where present."},
-            {"text": "\n\n---\n\n".join(partials)}
-        ],
-        generation_config={"temperature": GEMINI_TEMP, "max_output_tokens": GEMINI_MAX_TOKENS},
+        
+    combo_prompt = "Combine and deduplicate the partial analyses below into ONE cohesive report, strictly following the same 'TeachCoach' rubric with timestamps kept where present.\n\n" + "\n\n---\n\n".join(partials)
+    
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=combo_prompt,
+        config=config,
     )
     return (getattr(resp, "text", None) or "").strip()
 
@@ -840,17 +928,60 @@ def qna_heuristic(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"questions": questions}
 
 def _items_from_heuristic(segments: List[dict]) -> List[dict]:
-    h = qna_heuristic(segments)
-    items: List[dict] = []
-    for q in h.get("questions", []):
-        items.append({
-            "t": _mmss(q.get("t_start", 0.0)),
-            "speaker": "student",
-            "text": q.get("question", ""),
-            "answered": bool(q.get("answered", False)),
-            "student_id": (q.get("student_id") or "s?")
-        })
+    items = []
+    for s in segments:
+        txt = s.get("text", "").strip()
+        if "?" in txt:
+            items.append({
+                "t": _mmss(s.get("start", 0)),
+                "speaker": "student" if len(txt) < 150 else "teacher",
+                "student_id": "S1" if len(txt) < 150 else "T1",
+                "answered": True,
+                "text": txt
+            })
     return items
+
+def extract_qna_with_ai(transcript_text: str, segments: List[dict], visual_data: Optional[Dict[str, Any]] = None) -> Tuple[List[dict], str]:
+    """Uses Groq to extract Q&A items and generate a one-line insight."""
+    if not GROQ_API_KEY:
+        # Fallback to heuristic if no key
+        return _items_from_heuristic(segments), "AI extraction skipped (no API key)."
+
+    t_snip = _trim_middle(transcript_text or "", 3000)
+    
+    hand_info = ""
+    if visual_data:
+        evs = visual_data.get("hand_raise_events", [])
+        if evs:
+            hand_info = "Visual hand-raise events detected at: " + ", ".join([_mmss(e['t']) for e in evs[:10]])
+
+    prompt = (
+        "You are an expert education analyst. Extract student and teacher questions from the transcript. "
+        "Also consider the visual hand-raise data provided. "
+        "Return a JSON object with two fields:\n"
+        "1) 'items': a list of objects with {t: 'mm:ss', speaker: 'student'|'teacher', student_id: 'S1'|'T1'|..., answered: true|false, text: '...'}\n"
+        "2) 'insight': a one-sentence summary of the class engagement level.\n\n"
+        f"Transcript:\n{t_snip}\n\n{hand_info}"
+    )
+
+    try:
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                          json={
+                              "model": "llama-3.3-70b-versatile",
+                              "messages": [{"role": "user", "content": prompt}],
+                              "response_format": {"type": "json_object"},
+                              "temperature": 0.1
+                          }, timeout=15)
+        r.raise_for_status()
+        import json as json_mod
+        data = json_mod.loads(r.json()["choices"][0]["message"]["content"])
+        items = data.get("items", [])
+        insight = data.get("insight", "Great classroom interaction!")
+        return items, insight
+    except Exception as e:
+        print(f"[QnA AI] Failed: {e}")
+        return _items_from_heuristic(segments), "Could not generate AI insight."
 
 # ===================== Gmail SMTP helpers =====================
 def send_gmail_smtp(to_email: str, subject: str, body_text: str, body_html: Optional[str] = None) -> None:
@@ -1132,30 +1263,49 @@ def ranking_md(weights_store: Dict[str, Any], available_models: List[str]) -> st
 #   'openai' | 'gemini' |
 #   'both' (groq + ollama) | 'all' (all seven)
 
-def get_feedbacks(transcript_text: str, segments: List[dict], mode: str) -> dict:
-    m = (mode or "groq").lower()
-    if m == "all":
+def get_feedbacks(transcript_text: str, segments: List[dict], mode: str, visual_data: Optional[Dict[str, Any]] = None) -> dict:
+    m = (mode or "groq").lower().strip()
+    key_map = {
+        "groq": "groq",
+        "groq (gpt-oss-120b)": "groq",
+        "scout": "scout",
+        "groq (llama-4-scout)": "scout",
+        "openai": "openai",
+        "openai · gpt-4o-mini": "openai",
+        "gemini": "gemini",
+        "google · gemini": "gemini",
+        "or_deepseek_r1d_70b": "or_deepseek_r1d_70b",
+        "openrouter · deepseek r1-distill-llama-70b": "or_deepseek_r1d_70b",
+        "or_gemma2_9b_it": "or_gemma2_9b_it",
+        "openrouter · gemma2-9b-it": "or_gemma2_9b_it",
+        "ollama": "ollama",
+        "local · ollama": "ollama",
+    }
+    
+    internal_mode = key_map.get(m, m)
+
+    if internal_mode == "all":
         want = {"groq","scout","ollama","or_deepseek_r1d_70b","or_gemma2_9b_it","openai","gemini"}
-    elif m == "both":
+    elif internal_mode == "both":
         want = {"groq","ollama"}
     else:
-        want = {m}
+        want = {internal_mode}
 
     calls = {}
     with ThreadPoolExecutor(max_workers=len(want) or 1) as pool:
         if "groq" in want:
-            calls["groq"] = pool.submit(groq_feedback, transcript_text, segments)
+            calls["groq"] = pool.submit(groq_feedback, transcript_text, segments, visual_data)
         if "scout" in want:
-            calls["scout"] = pool.submit(groq_scout_feedback, transcript_text, segments)
+            calls["scout"] = pool.submit(groq_scout_feedback, transcript_text, segments, visual_data)
         if "ollama" in want:
-            calls["ollama"] = pool.submit(ollama_feedback, transcript_text, segments)
+            calls["ollama"] = pool.submit(ollama_feedback, transcript_text, segments, visual_data)
         if "openai" in want:
-            calls["openai"] = pool.submit(openai_feedback, transcript_text, segments)
+            calls["openai"] = pool.submit(openai_feedback, transcript_text, segments, visual_data)
         if "gemini" in want:
-            calls["gemini"] = pool.submit(gemini_feedback, transcript_text, segments)
+            calls["gemini"] = pool.submit(gemini_feedback, transcript_text, segments, visual_data)
         for key, model_id in OPENROUTER_MODELS.items():
             if key in want:
-                calls[key] = pool.submit(openrouter_feedback_model, transcript_text, segments, model_id)
+                calls[key] = pool.submit(openrouter_feedback_model, transcript_text, segments, model_id, visual_data)
 
         out = {}
         for name, fut in calls.items():
@@ -1180,19 +1330,26 @@ def qna_rows_from_items(items: List[dict]) -> List[List[Any]]:
         rows.append([round(tsec,2), round(tsec,2), sid, bool(it.get("answered", False)), it.get("text",""), "", spk])
     return rows
 
-def qna_summary_from_items(items: List[dict]) -> Dict[str, Any]:
+def qna_summary_from_items(items: List[dict], visual_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     total_stu = sum(1 for it in items if (it.get("speaker") or "").lower() == "student")
     total_tea = sum(1 for it in items if (it.get("speaker") or "").lower() == "teacher")
     uniq_students = len({(it.get("student_id") or "").lower()
                          for it in items if (it.get("speaker") or "").lower()=="student" and it.get("student_id")})
     answered_est = sum(1 for it in items if (it.get("speaker") or "").lower()=="student" and bool(it.get("answered")))
+    
+    hand_raises = 0
+    if visual_data:
+        # We can use the total unique estimate or just the event count
+        hand_raises = visual_data.get("hand_raise_unique", 0) or len(visual_data.get("hand_raise_events", []))
+
     return {
         "total_items": len(items),
         "total_student_questions": total_stu,
         "total_teacher_questions": total_tea,
         "unique_students_est": uniq_students,
         "answered": answered_est,
-        "unanswered": max(total_stu - answered_est, 0)
+        "unanswered": max(total_stu - answered_est, 0),
+        "hand_raises": hand_raises
     }
 
 # ===================== Streaming helpers =====================
@@ -1254,73 +1411,12 @@ def transcribe_stream(
     translate_to_en: bool,
     progress=gr.Progress(),
 ):
-    progress(0.02, desc="Preparing input…")
-
-    src_file = _normalize_uploaded(src_file)
-    mic_audio = _normalize_uploaded(mic_audio)
-    video_input = _normalize_uploaded(video_input)
-    chosen: Optional[Path] = None
-
-    # Handle different input sources with priority
     file_id = uuid.uuid4().hex
-    dst_media = None
-
-    if src_file and Path(src_file).exists():
-        # Uploaded file
-        src_path = Path(src_file)
-        dst_media = WORK_DIR / f"{file_id}{src_path.suffix.lower()}"
-        shutil.copy2(src_path, dst_media)
-
-    elif video_input and Path(video_input).exists():
-        # Webcam video recording
-        src_path = Path(video_input)
-        dst_media = WORK_DIR / f"{file_id}{src_path.suffix.lower()}"
-        shutil.copy2(src_path, dst_media)
-
-    elif mic_audio and Path(mic_audio).exists():
-        # Microphone audio recording
-        src_path = Path(mic_audio)
-        dst_media = WORK_DIR / f"{file_id}{src_path.suffix.lower()}"
-        shutil.copy2(src_path, dst_media)
-
-    elif _is_http_url(video_url):
-        # Video URL
-        dst_media = _download_media_from_url(video_url.strip(), WORK_DIR)
-        # Rename to include file_id
-        if dst_media and dst_media.exists():
-            new_dst = WORK_DIR / f"{file_id}{dst_media.suffix.lower()}"
-            dst_media.rename(new_dst)
-            dst_media = new_dst
-
-    if not dst_media or not dst_media.exists():
-        # Debug: check what inputs we received
-        debug_info = []
-        if src_file:
-            debug_info.append(f"src_file: {src_file} (exists: {Path(src_file).exists() if src_file else False})")
-        if video_input:
-            debug_info.append(f"video_input: {video_input} (exists: {Path(video_input).exists() if video_input else False})")
-        if mic_audio:
-            debug_info.append(f"mic_audio: {mic_audio} (exists: {Path(mic_audio).exists() if mic_audio else False})")
-        if video_url:
-            debug_info.append(f"video_url: {video_url}")
-
-        debug_msg = "Debug info: " + "; ".join(debug_info) if debug_info else "No inputs provided"
-        raise gr.Error(f"No valid media provided (upload a file or paste a URL). {debug_msg}")
-
-    chosen = dst_media
-
-    progress(0.05, desc="Extracting audio…")
-    wav = ensure_wav(dst_media)
-    audio_len = _ffprobe_duration(wav)
-
-    use_long = ALWAYS_SEGMENT or (audio_len and audio_len > MAX_DIRECT_SEC)
-    task_mode = "translate" if translate_to_en else "transcribe"
-
     state = {
         "file_id": file_id,
-        "media_path": str(dst_media),
-        "wav_path": str(wav),
-        "duration_sec": float(audio_len or 0.0),
+        "media_path": "",
+        "wav_path": str(AUDIO_DIR / f"{file_id}.wav"),
+        "duration_sec": 0.0,
         "segments": [],
         "transcript_text": "",
         "qna_rows": [],
@@ -1331,19 +1427,81 @@ def transcribe_stream(
         "available_models": [],
     }
 
-    mongo_id = store_teaching_result(
-        result_payload={
-            "type": "transcription",
-            "file_id": file_id,
-            "transcript": "",
-            "segments": [],
-            "qna_summary": {},
-            "duration_sec": float(audio_len or 0.0),
-        },
-        context_meta={"media_path": str(dst_media)},
+    yield pack_outputs(
+        transcript_text="",
+        seg_rows=[],
+        primary_text="Connecting / Preparing input…",
+        engine_note="—",
+        fb_openai="",
+        fb_gemini="",
+        fb_groq="",
+        fb_scout="",
+        fb_ollama="",
+        fb_or_deepseek="",
+        fb_or_gemma="",
+        qna_md="",
+        qna_rows=[],
+        visuals_md="",
+        gallery_imgs=[],
+        ranking_md="—",
+        vote_dd_update=gr.update(choices=[], value=None),
+        raw_json=json.dumps({"file_id": file_id, "status": "starting"}, indent=2),
+        state_dict=state,
     )
-    state["mongo_saved"] = bool(mongo_id)
-    state["mongo_id"] = mongo_id
+
+    src_file = _normalize_uploaded(src_file)
+    mic_audio = _normalize_uploaded(mic_audio)
+    video_input = _normalize_uploaded(video_input)
+    chosen: Optional[Path] = None
+    dst_media = None
+
+    if src_file and Path(src_file).exists():
+        src_path = Path(src_file)
+        dst_media = WORK_DIR / f"{file_id}{src_path.suffix.lower()}"
+        shutil.copy2(src_path, dst_media)
+    elif video_input and Path(video_input).exists():
+        src_path = Path(video_input)
+        dst_media = WORK_DIR / f"{file_id}{src_path.suffix.lower()}"
+        shutil.copy2(src_path, dst_media)
+    elif mic_audio and Path(mic_audio).exists():
+        src_path = Path(mic_audio)
+        dst_media = WORK_DIR / f"{file_id}{src_path.suffix.lower()}"
+        shutil.copy2(src_path, dst_media)
+    elif _is_http_url(video_url):
+        progress(0.05, desc="Downloading URL…")
+        dst_media = _download_media_from_url(video_url.strip(), WORK_DIR)
+        if dst_media and dst_media.exists():
+            new_dst = WORK_DIR / f"{file_id}{dst_media.suffix.lower()}"
+            dst_media.rename(new_dst)
+            dst_media = new_dst
+
+    if not dst_media or not dst_media.exists():
+        raise gr.Error("No valid media provided or download failed.")
+
+    state["media_path"] = str(dst_media)
+    audio_len = _ffprobe_duration(dst_media)
+    state["duration_sec"] = float(audio_len or 0.0)
+
+    use_long = ALWAYS_SEGMENT or (audio_len and audio_len > MAX_DIRECT_SEC)
+    task_mode = "translate" if translate_to_en else "transcribe"
+
+    import threading
+    def _bg_store():
+        mongo_id = store_teaching_result(
+            result_payload={
+                "type": "transcription",
+                "file_id": file_id,
+                "transcript": "",
+                "segments": [],
+                "qna_summary": {},
+                "duration_sec": state["duration_sec"],
+            },
+            context_meta={"media_path": state["media_path"]},
+        )
+        state["mongo_saved"] = bool(mongo_id)
+        state["mongo_id"] = mongo_id
+    
+    threading.Thread(target=_bg_store, daemon=True).start()
 
     yield pack_outputs(
         transcript_text="",
@@ -1404,29 +1562,79 @@ def transcribe_stream(
         )
 
     if use_long:
-        progress(0.08, desc=f"Segmenting audio into {CHUNK_SEC}s parts…")
-        parts = segment_wav(wav, CHUNK_SEC)
-        for idx, part in enumerate(parts, 1):
-            progress(0.10 + 0.70 * (idx / max(1, len(parts))), desc=f"Chunk {idx}/{len(parts)}")
-            first_prompt = initial_prompt if idx == 1 else ""
-            for seg, _dur in transcribe_wav_iter(part, language_hint, first_prompt, task_mode):
-                seg2 = {"start": seg["start"] + total_off, "end": seg["end"] + total_off, "text": seg["text"]}
-                all_segments.append(seg2)
-                if seg2["text"]:
-                    transcript_parts.append(seg2["text"])
-                packed = emit(status=f"chunk {idx}/{len(parts)}")
-                if packed is not None:
-                    yield packed
-            total_off += float(CHUNK_SEC)
+        if audio_len and audio_len > 0:
+            total_parts = max(1, int(math.ceil(float(audio_len) / float(CHUNK_SEC))))
+            progress(0.08, desc=f"Starting chunked streaming ({total_parts} chunks)…")
+            
+            # PIONEER CHUNK: Use a smaller first chunk (e.g. 15s) for instant feedback
+            pioneer_sec = min(15.0, float(CHUNK_SEC))
+            
+            for idx in range(1, total_parts + 2): # +1 potential extra if pioneer shift happens
+                if idx == 1:
+                    start_sec = 0.0
+                    dur_sec = min(pioneer_sec, float(audio_len))
+                else:
+                    # Adjust subsequent chunks to skip the pioneer part
+                    start_sec = pioneer_sec + (idx - 2) * CHUNK_SEC
+                    dur_sec = min(float(CHUNK_SEC), float(audio_len) - start_sec)
+                
+                if dur_sec <= 0:
+                    break
+                    
+                part = AUDIO_DIR / f"{file_id}_part_{idx:04d}.wav"
+                progress(0.10 + 0.70 * (min(idx, total_parts) / total_parts), desc=f"Chunk {idx}")
+                try:
+                    extract_wav_slice(dst_media, start_sec, dur_sec, part)
+                    first_prompt = initial_prompt if idx == 1 else ""
+                    for seg, _dur in transcribe_wav_iter(part, language_hint, first_prompt, task_mode):
+                        seg2 = {"start": seg["start"] + start_sec, "end": seg["end"] + start_sec, "text": seg["text"]}
+                        all_segments.append(seg2)
+                        if seg2["text"]:
+                            transcript_parts.append(seg2["text"])
+                        packed = emit(status=f"chunk {idx}")
+                        if packed is not None:
+                            yield packed
+                finally:
+                    try:
+                        if part.exists():
+                            part.unlink()
+                    except Exception:
+                        pass
+        else:
+            progress(0.08, desc=f"Segmenting audio into {CHUNK_SEC}s parts…")
+            wav = ensure_wav(dst_media)
+            parts = segment_wav(wav, CHUNK_SEC)
+            for idx, part in enumerate(parts, 1):
+                progress(0.10 + 0.70 * (idx / max(1, len(parts))), desc=f"Chunk {idx}/{len(parts)}")
+                first_prompt = initial_prompt if idx == 1 else ""
+                for seg, _dur in transcribe_wav_iter(part, language_hint, first_prompt, task_mode):
+                    seg2 = {"start": seg["start"] + total_off, "end": seg["end"] + total_off, "text": seg["text"]}
+                    all_segments.append(seg2)
+                    if seg2["text"]:
+                        transcript_parts.append(seg2["text"])
+                    packed = emit(status=f"chunk {idx}/{len(parts)}")
+                    if packed is not None:
+                        yield packed
+                total_off += float(CHUNK_SEC)
     else:
         progress(0.10, desc="Transcribing (streaming)…")
-        for seg, _dur in transcribe_wav_iter(wav, language_hint, initial_prompt, task_mode):
-            all_segments.append(seg)
-            if seg["text"]:
-                transcript_parts.append(seg["text"])
-            packed = emit(status="streaming")
-            if packed is not None:
-                yield packed
+        try:
+            for seg, _dur in transcribe_wav_iter(dst_media, language_hint, initial_prompt, task_mode):
+                all_segments.append(seg)
+                if seg["text"]:
+                    transcript_parts.append(seg["text"])
+                packed = emit(status="streaming")
+                if packed is not None:
+                    yield packed
+        except Exception:
+            wav = ensure_wav(dst_media)
+            for seg, _dur in transcribe_wav_iter(wav, language_hint, initial_prompt, task_mode):
+                all_segments.append(seg)
+                if seg["text"]:
+                    transcript_parts.append(seg["text"])
+                packed = emit(status="streaming")
+                if packed is not None:
+                    yield packed
 
     progress(0.90, desc="Deriving Q&A…")
     transcript_text = " ".join(transcript_parts)
@@ -1505,8 +1713,23 @@ def generate_feedback(
     }
     mode = mode_map.get(feedback_engine_choice, "groq")
 
-    fb_map = get_feedbacks(transcript_text, segments, mode)
-    ordered_keys = fb_map.pop("_ordered_keys", [])
+    # Assuming visual data might be retrieved from state if analyze_visuals was run
+    visual_data = state.get("visuals")
+    new_fb_map = get_feedbacks(transcript_text, segments, mode, visual_data=visual_data)
+    new_ordered_keys = new_fb_map.pop("_ordered_keys", [])
+    
+    fb_map = state.get("feedback_map", {})
+    for k, v in new_fb_map.items():
+        fb_map[k] = v
+        
+    ordered_keys = state.get("ordered_keys", [])
+    for k in new_ordered_keys:
+        if k not in ordered_keys:
+            ordered_keys.append(k)
+    # If no keys existed yet, add from dictionary keys
+    for k in fb_map.keys():
+        if k not in ordered_keys:
+            ordered_keys.append(k)
 
     primary = "*No feedback produced.*"
     for k in ordered_keys:
@@ -1671,7 +1894,12 @@ def process(
     else:
         mode = "groq"
 
-    feedback_map = get_feedbacks(transcript_text, segments, mode)
+    # visuals
+    visuals: Dict[str, Any] = {}
+    if analyze_visuals_flag:
+        visuals = analyze_visuals(dst_vid, file_id)
+
+    feedback_map = get_feedbacks(transcript_text, segments, mode, visual_data=visuals)
 
     # ORDERED primary by adaptive weight
     ordered_keys = feedback_map.pop("_ordered_keys", [])
@@ -1686,9 +1914,7 @@ def process(
     used_engine = ", ".join(ordered_keys) if ordered_keys else ", ".join(sorted(feedback_map.keys()))
 
     # visuals: append to each feedback
-    visuals: Dict[str, Any] = {}
     if analyze_visuals_flag:
-        visuals = analyze_visuals(dst_vid, file_id)
         vr = visuals
         hand_line = f"- *Students raised hands (unique est.)*: {vr.get('hand_raise_unique', 0)}"
         board_line = f"- *Board snapshots*: {len(vr.get('board_snapshots', []))}"
@@ -1912,148 +2138,287 @@ def analyze_visuals(video_path: Path, file_id: str) -> Dict[str, Any]:
 # ===================== UI =====================
 LANG_OPTIONS = ["auto", "en", "hi", "bn", "ta", "te", "mr", "gu", "kn", "ml", "pa"]
 
+# Custom CSS for Premium Look (Forced Light Mode)
+CUSTOM_CSS = """
+:root {
+    --background-fill-primary: #ffffff !important;
+    --background-fill-secondary: #fdfdfd !important;
+    --border-color-primary: #e5e7eb !important;
+    --body-text-color: #111827 !important;
+    --primary-500: #2563eb !important;
+    --block-border-color: #e5e7eb !important;
+    --input-background-fill: #ffffff !important;
+}
 
-with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedback + Visuals + Adaptive Ranking") as demo:
-    gr.Markdown("# Lecture Analyzer · Fast CPU Streaming")
-    gr.Markdown(
-        "Transcribe lectures quickly on CPU with live updates, then compare AI feedback engines once the text is ready."
-    )
+/* Base Body Styles */
+body { 
+    background-color: #f9fafb !important; 
+    color: #111827 !important; 
+    font-family: 'Inter', system-ui, -apple-system, sans-serif !important;
+}
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            video_url_tb = gr.Textbox(
-                label="Video URL (http/https)",
-                placeholder="https://... (YouTube, Drive, direct media, etc.)",
-            )
-            inp = gr.File(label="Upload lecture video/audio", file_types=["video", "audio"], type="filepath")
-            mic_input = gr.Audio(label="Record audio with microphone", sources=["microphone"], type="filepath")
-            video_input = gr.Video(label="Record video with webcam", sources=["webcam"], format="mp4", include_audio=True)
-            with gr.Row():
-             lang = gr.Dropdown(LANG_OPTIONS, value="auto", label="Language (hint)")
-            translate_toggle = gr.Checkbox(
-                    label="Translate non-English → English",
-                    value=TRANSLATE_DEFAULT,
-                )
-            iprompt = gr.Textbox(
-                label="Initial prompt / topic hint (optional)",
-                lines=2,
-                placeholder="e.g., Class 10 Arithmetic Progression: define AP, nth term, sum, examples",
-            )
-            btn_transcribe = gr.Button("Transcribe (FAST streaming)", variant="primary")
+.gradio-container { 
+    background-color: #f9fafb !important; 
+    border: none !important; 
+    padding: 20px !important;
+}
 
-        with gr.Column(scale=1):
-            gr.Markdown("### Feedback engines")
-            feedback_engine_dd = gr.Radio(
-                choices=[
-                    "Groq (gpt-oss-120b)",
-                    "Groq (Llama-4-Scout)",
-                    "OpenAI · GPT-4o-mini",
-                    "Google · Gemini",
-                    "OpenRouter · DeepSeek R1-Distill-Llama-70B",
-                    "OpenRouter · Gemma2-9B-IT",
-                    "All (compare)",
-                ],
-                value="Groq (gpt-oss-120b)",
-                label="Choose model(s) for feedback",
-            )
-            btn_feedback = gr.Button("Generate Feedback", variant="secondary")
-            gr.Markdown(
-                "*Tip: run Transcribe first, then generate feedback from any engine or run All to compare results.*"
-            )
+/* Force light mode for all main containers */
+.login-container, .app-container, .mode-box, .gr-box, .gr-form, .gr-panel, .gr-group, .gr-block { 
+    background-color: #ffffff !important; 
+    color: #111827 !important; 
+    border: 1px solid #e5e7eb !important;
+    border-radius: 16px !important;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03) !important;
+    margin-bottom: 20px !important;
+}
 
-    st = gr.State({})
+/* Login Card refinement */
+.login-container { 
+    max-width: 450px !important; 
+    margin: 80px auto !important; 
+    padding: 3rem !important; 
+    border: 1px solid #e2e8f0 !important; 
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.08) !important;
+}
 
-    with gr.Tabs():
-     with gr.Tab("Transcript"):
-        transcript_box = gr.Textbox(label="Transcript", lines=12)
+/* Mode Buttons styling */
+.mode-btn { 
+    background-color: #ffffff !important; 
+    border: 1px solid #e5e7eb !important; 
+    border-radius: 14px !important; 
+    padding: 2rem !important; 
+    height: auto !important;
+    transition: all 0.3s ease !important; 
+    color: #1e293b !important;
+}
 
-    with gr.Tab("Segments"):
-        segtbl = gr.Dataframe(
-            headers=["start", "end", "text"],
-            datatype=["number", "number", "str"],
-            wrap=True,
-            value=[],
-        )
+.mode-btn:hover { 
+    border-color: #2563eb !important; 
+    background-color: #f0f7ff !important; 
+    transform: translateY(-4px) !important;
+    box-shadow: 0 10px 15px -3px rgba(37, 99, 235, 0.1) !important;
+}
 
-    with gr.Tab("Teaching Feedback"):
-        gr.Markdown("### Teaching Feedback Overview")
-        feedback_primary_box = gr.Markdown()
-        engine_md = gr.Markdown()
-        email_recipient_tb = gr.Textbox(
-            label="Email recipients (optional)",
-            placeholder="teacher@example.com, mentor@example.com",
-            lines=1,
-        )
-        gr.Markdown(
-            "Leave the recipient box empty to use the default mailing list. "
-            "Each model section below includes a button to send its feedback plus the captured Q&A summary."
-        )
+/* Typography Headings */
+h1, h2, h3, h4, .gr-button, .gr-label { 
+    color: #0f172a !important; 
+    font-weight: 600 !important;
+}
 
-        with gr.Accordion(MODEL_DISPLAY_NAMES["groq"], open=False):
-            fb_groq = gr.Markdown()
-            with gr.Row():
-                send_groq_btn = gr.Button("Send Groq feedback to email", variant="primary")
-            groq_email_status = gr.Markdown()
+h1 { font-weight: 800 !important; letter-spacing: -0.025em !important; }
 
-        with gr.Accordion(MODEL_DISPLAY_NAMES["scout"], open=False):
-            fb_scout = gr.Markdown()
-            with gr.Row():
-                send_scout_btn = gr.Button("Send Scout feedback to email", variant="primary")
-            scout_email_status = gr.Markdown()
+/* Dashboard Container */
+.app-container { 
+    background: #ffffff !important; 
+    padding: 2.5rem !important;
+    border: 1px solid #e5e7eb !important;
+}
 
-        with gr.Accordion(MODEL_DISPLAY_NAMES["openai"], open=False):
-            fb_openai = gr.Markdown()
-            with gr.Row():
-                send_openai_btn = gr.Button("Send OpenAI feedback to email", variant="primary")
-            openai_email_status = gr.Markdown()
+/* Fix visibility for inputs and textareas */
+input, textarea, select, .gr-input, .gr-textbox {
+    background-color: #ffffff !important;
+    border: 1px solid #d1d5db !important;
+    border-radius: 10px !important;
+    color: #111827 !important;
+    padding: 10px 14px !important;
+}
 
-        with gr.Accordion(MODEL_DISPLAY_NAMES["gemini"], open=False):
-            fb_gemini = gr.Markdown()
-            with gr.Row():
-                send_gemini_btn = gr.Button("Send Gemini feedback to email", variant="primary")
-            gemini_email_status = gr.Markdown()
+input:focus, textarea:focus {
+    border-color: #2563eb !important;
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1) !important;
+}
 
-        with gr.Accordion(MODEL_DISPLAY_NAMES["or_deepseek_r1d_70b"], open=False):
-            fb_or_deepseek = gr.Markdown()
-            with gr.Row():
-                send_deepseek_btn = gr.Button("Send DeepSeek feedback to email", variant="primary")
-            deepseek_email_status = gr.Markdown()
+/* Accordions and Tabs */
+.gr-accordion { border: 1px solid #e5e7eb !important; margin-bottom: 10px !important; }
+.gr-tab-button { font-weight: 600 !important; }
+.gr-tab-button-active { border-bottom: 2px solid #2563eb !important; color: #2563eb !important; }
 
-        with gr.Accordion(MODEL_DISPLAY_NAMES["or_gemma2_9b_it"], open=False):
-            fb_or_gemma = gr.Markdown()
-            with gr.Row():
-                send_gemma_btn = gr.Button("Send Gemma feedback to email", variant="primary")
-            gemma_email_status = gr.Markdown()
+/* Buttons */
+.gr-button-primary {
+    background: linear-gradient(135deg, #2563eb 0%, #1e40af 100%) !important;
+    border: none !important;
+    box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2) !important;
+}
 
-        gr.Markdown("#### Additional models (auto)")
-        gr.Markdown(
-            "When you run `All (compare)`, any extra model outputs (for example, Local Ollama) will appear below."
-        )
-        fb_ollama = gr.Markdown(visible=False)
+.gr-button-secondary {
+    background-color: #ffffff !important;
+    border: 1px solid #e5e7eb !important;
+    color: #475569 !important;
+}
 
-    with gr.Tab("Q&A Stats"):
-        qna_summary_md = gr.Markdown()
-        qna_tbl = gr.Dataframe(
-            headers=["t_start", "t_end", "student_id", "answered", "question", "answer_span", "notes"],
-            datatype=["number", "number", "str", "bool", "str", "str", "str"],
-            wrap=True,
-            value=[],
-        )
+/* Hide Graduate/Gradio footer */
+footer { display: none !important; }
+"""
 
-    with gr.Tab("Visuals"):
-        visuals_md = gr.Markdown()
-        board_gallery = gr.Gallery(label="Board snapshots", columns=3, height=300)
+with gr.Blocks(title="Lecture Analyzer") as demo:
+    # State for login status
+    login_state = gr.State(False)
 
-    with gr.Tab("Model Ranking & Votes"):
-        ranking_md_box = gr.Markdown(value="Run feedback to see ranking…")
-        vote_model_dd = gr.Dropdown(choices=[], label="Model to vote", interactive=True)
+    # --- PAGE 1: LOGIN ---
+    with gr.Column(visible=True, elem_classes="login-container") as login_box:
+        gr.Markdown("# 🔐 Sign In\nWelcome back! Please enter your credentials to access the analyzer.")
+        user_input = gr.Textbox(label="Username", placeholder="Enter username...", lines=1)
+        pass_input = gr.Textbox(label="Password", placeholder="Enter password...", type="password", lines=1)
+        login_btn = gr.Button("Login to Dashboard", variant="primary")
+        login_error = gr.Markdown(visible=False)
+
+    # --- PAGE 2: MODE SELECTION ---
+    with gr.Column(visible=False) as mode_box:
+        with gr.Column(elem_classes="main-header"):
+            gr.Markdown("# 🎓 Select Study Mode\nHow would you like to provide the lecture content today?")
+        
         with gr.Row():
-         up_btn = gr.Button("👍 Thumbs Up", variant="primary")
-        down_btn = gr.Button("👎 Thumbs Down", variant="secondary")
-        vote_result_md = gr.Markdown()
+            with gr.Column(scale=1):
+                btn_mode_upload = gr.Button("📂 Upload Media\nLocal file from your computer", variant="secondary", elem_classes="mode-btn")
+            with gr.Column(scale=1):
+                btn_mode_link = gr.Button("🔗 Paste Link\nYouTube, Drive, or Direct URL", variant="secondary", elem_classes="mode-btn")
+            with gr.Column(scale=1):
+                btn_mode_live = gr.Button("🎙️ Record Live\nMicrophone or Webcam stream", variant="secondary", elem_classes="mode-btn")
 
-    with gr.Tab("Raw JSON"):
-        rawjson_box = gr.Code(label="JSON", language="json")
+    # --- PAGE 3: MAIN APP ---
+    with gr.Column(visible=False, elem_classes="app-container") as app_box:
+        with gr.Row():
+            with gr.Column(scale=4):
+                gr.Markdown("# 📘 Lecture Analyzer · Dashboard")
+            with gr.Column(scale=1):
+                logout_btn = gr.Button("Back to Modes", variant="secondary")
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                # Wrapped Inputs
+                with gr.Group() as input_group:
+                    video_url_tb = gr.Textbox(
+                        label="Video URL (http/https)",
+                        placeholder="https://... (YouTube, Drive, direct media, etc.)",
+                        visible=False
+                    )
+                    inp = gr.File(label="Upload lecture video/audio", file_types=["video", "audio"], type="filepath", visible=False)
+                    mic_input = gr.Audio(label="Record audio with microphone", sources=["microphone"], type="filepath", visible=False)
+                    video_input = gr.Video(label="Record video with webcam", sources=["webcam"], format="mp4", include_audio=True, visible=False)
+                
+                with gr.Row():
+                    lang = gr.Dropdown(LANG_OPTIONS, value="auto", label="Language (hint)")
+                translate_toggle = gr.Checkbox(label="Translate non-English → English", value=TRANSLATE_DEFAULT)
+                iprompt = gr.Textbox(label="Initial prompt / topic hint (optional)", lines=2, placeholder="Topic hint...")
+                btn_transcribe = gr.Button("🚀 Start Analyzing", variant="primary")
+
+            with gr.Column(scale=1):
+                gr.Markdown("### 🤖 Feedback Engine")
+                feedback_engine_dd = gr.Radio(
+                    choices=[
+                        "Groq (gpt-oss-120b)",
+                        "Groq (Llama-4-Scout)",
+                        "OpenAI · GPT-4o-mini",
+                        "Google · Gemini",
+                        "OpenRouter · DeepSeek R1-Distill-Llama-70B",
+                        "OpenRouter · Gemma2-9B-IT",
+                        "All (compare)",
+                    ],
+                    value="Groq (gpt-oss-120b)",
+                    label="Choose AI for analysis",
+                )
+                btn_feedback = gr.Button("Generate Insights", variant="secondary")
+
+        st = gr.State({})
+
+        with gr.Tabs():
+         with gr.Tab("Transcript"):
+            transcript_box = gr.Textbox(label="Transcript", lines=12)
+
+         with gr.Tab("Segments"):
+            segtbl = gr.Dataframe(
+                headers=["start", "end", "text"],
+                datatype=["number", "number", "str"],
+                wrap=True,
+                value=[],
+            )
+
+         with gr.Tab("Teaching Feedback"):
+            gr.Markdown("### Teaching Feedback Overview")
+            feedback_primary_box = gr.Markdown()
+            engine_md = gr.Markdown()
+            email_recipient_tb = gr.Textbox(
+                label="Email recipients (optional)",
+                placeholder="teacher@example.com, mentor@example.com",
+                lines=1,
+            )
+            gr.Markdown(
+                "Leave the recipient box empty to use the default mailing list. "
+                "Each model section below includes a button to send its feedback plus the captured Q&A summary."
+            )
+
+            with gr.Accordion(MODEL_DISPLAY_NAMES["groq"], open=False):
+                fb_groq = gr.Markdown()
+                with gr.Row():
+                    gen_groq_btn = gr.Button("Generate Groq feedback", variant="secondary")
+                    send_groq_btn = gr.Button("Send Groq feedback to email", variant="primary")
+                groq_email_status = gr.Markdown()
+
+            with gr.Accordion(MODEL_DISPLAY_NAMES["scout"], open=False):
+                fb_scout = gr.Markdown()
+                with gr.Row():
+                    gen_scout_btn = gr.Button("Generate Scout feedback", variant="secondary")
+                    send_scout_btn = gr.Button("Send Scout feedback to email", variant="primary")
+                scout_email_status = gr.Markdown()
+
+            with gr.Accordion(MODEL_DISPLAY_NAMES["openai"], open=False):
+                fb_openai = gr.Markdown()
+                with gr.Row():
+                    gen_openai_btn = gr.Button("Generate OpenAI feedback", variant="secondary")
+                    send_openai_btn = gr.Button("Send OpenAI feedback to email", variant="primary")
+                openai_email_status = gr.Markdown()
+
+            with gr.Accordion(MODEL_DISPLAY_NAMES["gemini"], open=False):
+                fb_gemini = gr.Markdown()
+                with gr.Row():
+                    gen_gemini_btn = gr.Button("Generate Gemini feedback", variant="secondary")
+                    send_gemini_btn = gr.Button("Send Gemini feedback to email", variant="primary")
+                gemini_email_status = gr.Markdown()
+
+            with gr.Accordion(MODEL_DISPLAY_NAMES["or_deepseek_r1d_70b"], open=False):
+                fb_or_deepseek = gr.Markdown()
+                with gr.Row():
+                    gen_deepseek_btn = gr.Button("Generate DeepSeek feedback", variant="secondary")
+                    send_deepseek_btn = gr.Button("Send DeepSeek feedback to email", variant="primary")
+                deepseek_email_status = gr.Markdown()
+
+            with gr.Accordion(MODEL_DISPLAY_NAMES["or_gemma2_9b_it"], open=False):
+                fb_or_gemma = gr.Markdown()
+                with gr.Row():
+                    gen_gemma_btn = gr.Button("Generate Gemma feedback", variant="secondary")
+                    send_gemma_btn = gr.Button("Send Gemma feedback to email", variant="primary")
+                gemma_email_status = gr.Markdown()
+
+            gr.Markdown("#### Additional models (auto)")
+            gr.Markdown(
+                "When you run `All (compare)`, any extra model outputs (for example, Local Ollama) will appear below."
+            )
+            fb_ollama = gr.Markdown(visible=False)
+
+         with gr.Tab("Q&A Stats"):
+            qna_summary_md = gr.Markdown()
+            qna_tbl = gr.Dataframe(
+                headers=["t_start", "t_end", "student_id", "answered", "question", "answer_span", "notes"],
+                datatype=["number", "number", "str", "bool", "str", "str", "str"],
+                wrap=True,
+                value=[],
+            )
+
+         with gr.Tab("Visuals"):
+            visuals_md = gr.Markdown()
+            board_gallery = gr.Gallery(label="Board snapshots", columns=3, height=300)
+
+         with gr.Tab("Model Ranking & Votes"):
+            ranking_md_box = gr.Markdown(value="Run feedback to see ranking…")
+            vote_model_dd = gr.Dropdown(choices=[], label="Model to vote", interactive=True)
+            with gr.Row():
+             up_btn = gr.Button("👍 Thumbs Up", variant="primary")
+            down_btn = gr.Button("👎 Thumbs Down", variant="secondary")
+            vote_result_md = gr.Markdown()
+
+         with gr.Tab("Raw JSON"):
+            rawjson_box = gr.Code(label="JSON", language="json")
 
     outputs = [
         transcript_box,
@@ -2083,33 +2448,79 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
         gemma_email_status,
     ]
 
+    # ===================== LOGIC & TRANSITIONS =====================
+    
+    def attempt_login(u, p):
+        if u == "adminuser" and p == "admin@1234":
+            return gr.update(visible=False), gr.update(visible=True), True, ""
+        else:
+            return gr.update(), gr.update(), False, "❌ Invalid credentials. Try 'adminuser' / 'admin@1234'"
+
+    login_btn.click(
+        attempt_login, 
+        inputs=[user_input, pass_input], 
+        outputs=[login_box, mode_box, login_state, login_error]
+    )
+
+    def show_app(mode):
+        return {
+            mode_box: gr.update(visible=False),
+            app_box: gr.update(visible=True),
+            video_url_tb: gr.update(visible=(mode == "link")),
+            inp: gr.update(visible=(mode == "upload")),
+            mic_input: gr.update(visible=(mode == "live")),
+            video_input: gr.update(visible=(mode == "live")),
+        }
+
+    btn_mode_upload.click(lambda: show_app("upload"), None, [mode_box, app_box, video_url_tb, inp, mic_input, video_input])
+    btn_mode_link.click(lambda: show_app("link"), None, [mode_box, app_box, video_url_tb, inp, mic_input, video_input])
+    btn_mode_live.click(lambda: show_app("live"), None, [mode_box, app_box, video_url_tb, inp, mic_input, video_input])
+
+    logout_btn.click(
+        lambda: (gr.update(visible=True), gr.update(visible=False)),
+        None,
+        [mode_box, app_box]
+    )
+
+    def make_gen_fb(choice):
+        def fn(state, progress=gr.Progress()):
+            return generate_feedback(state, choice, progress=progress)
+        return fn
+
+    gen_groq_btn.click(make_gen_fb("Groq (gpt-oss-120b)"), inputs=[st], outputs=outputs)
+    gen_scout_btn.click(make_gen_fb("Groq (Llama-4-Scout)"), inputs=[st], outputs=outputs)
+    gen_openai_btn.click(make_gen_fb("OpenAI · GPT-4o-mini"), inputs=[st], outputs=outputs)
+    gen_gemini_btn.click(make_gen_fb("Google · Gemini"), inputs=[st], outputs=outputs)
+    gen_deepseek_btn.click(make_gen_fb("OpenRouter · DeepSeek R1-Distill-Llama-70B"), inputs=[st], outputs=outputs)
+    gen_gemma_btn.click(make_gen_fb("OpenRouter · Gemma2-9B-IT"), inputs=[st], outputs=outputs)
+
     send_groq_btn.click(
         lambda recipients, s: send_model_feedback_email("groq", recipients, s),
         inputs=[email_recipient_tb, st],
         outputs=[groq_email_status],
     )
     send_scout_btn.click(
-        lambda recipients, s: send_model_feedback_email("scout", recipients, s),
+        lambda recipients, st: send_model_feedback_email("scout", recipients, st),
         inputs=[email_recipient_tb, st],
         outputs=[scout_email_status],
     )
     send_openai_btn.click(
-        lambda recipients, s: send_model_feedback_email("openai", recipients, s),
+        lambda recipients, st: send_model_feedback_email("openai", recipients, st),
         inputs=[email_recipient_tb, st],
         outputs=[openai_email_status],
     )
     send_gemini_btn.click(
-        lambda recipients, s: send_model_feedback_email("gemini", recipients, s),
+        lambda recipients, st: send_model_feedback_email("gemini", recipients, st),
         inputs=[email_recipient_tb, st],
         outputs=[gemini_email_status],
     )
     send_deepseek_btn.click(
-        lambda recipients, s: send_model_feedback_email("or_deepseek_r1d_70b", recipients, s),
+        lambda recipients, st: send_model_feedback_email("or_deepseek_r1d_70b", recipients, st),
         inputs=[email_recipient_tb, st],
         outputs=[deepseek_email_status],
     )
     send_gemma_btn.click(
-        lambda recipients, s: send_model_feedback_email("or_gemma2_9b_it", recipients, s),
+        lambda recipients, st: send_model_feedback_email("or_gemma2_9b_it", recipients, st),
         inputs=[email_recipient_tb, st],
         outputs=[gemma_email_status],
     )
@@ -2119,7 +2530,6 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
         inputs=[inp, video_url_tb, mic_input, video_input, lang, iprompt, translate_toggle],
         outputs=outputs,
         api_name=False,
-        show_api=False,
     )
 
     btn_feedback.click(
@@ -2127,7 +2537,6 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
         inputs=[st, feedback_engine_dd],
         outputs=outputs,
         api_name=False,
-        show_api=False,
     )
 
     up_btn.click(
@@ -2159,23 +2568,349 @@ def pick_free_port(preferred: Optional[str] = None, start: int = 7860, end: int 
             return p
     return None
 
-if __name__ == "__main__":
-    env_port = os.getenv("GRADIO_SERVER_PORT") or os.getenv("PORT")
-    port = pick_free_port(env_port)
-    share_flag = bool(int(os.getenv("GRADIO_SHARE", "0")))
-    host = os.getenv("GRADIO_HOST", "127.0.0.1")
+# Gradio launch is handled via FastAPI mounting below
+# ============================================================
+#  FastAPI JSON API for the React frontend
+# ============================================================
+app = FastAPI(title="Lecture Analyzer API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # dev only — lock down for prod
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _run_full_pipeline(media_path: Path, language: str, prompt: str, translate: bool) -> Dict[str, Any]:
+    """Run transcription + Q&A + feedback. Returns the React-shaped payload."""
+    # 1. transcribe (auto chooses long vs short)
+    duration_guess = _ffprobe_duration(media_path)
+    task_mode = "translate" if translate else "transcribe"
+
+    if ALWAYS_SEGMENT or duration_guess > MAX_DIRECT_SEC:
+        segments, transcript_text, duration = transcribe_long(media_path, language, prompt, task_mode)
+    else:
+        wav = extract_audio(media_path)
+        segments, transcript_text, duration = transcribe_short(wav, language, prompt, task_mode)
+
+    # 2. Visuals
+    visuals = analyze_visuals(media_path, uuid.uuid4().hex)
+
+    # 3. Q&A (AI-powered)
+    items, qna_insight = extract_qna_with_ai(transcript_text, segments, visual_data=visuals)
+    qna_summary = qna_summary_from_items(items, visual_data=visuals)
+    qna_payload = [
+        {
+            "t": it.get("t", "00:00"),
+            "speaker": it.get("speaker", "student"),
+            "student_id": it.get("student_id", "s?"),
+            "answered": bool(it.get("answered", False)),
+            "text": it.get("text", ""),
+        }
+        for it in items
+    ]
+    
+    # 4. Feedback from all providers
+    fb = get_feedbacks(transcript_text, segments, mode="all", visual_data=visuals)
+    fb.pop("_ordered_keys", None)
+
+    # 4. Ranking
+    store = _load_weights()
+    ranking = []
+    for k in fb.keys():
+        up, down = _vote_tuple(store, k)
+        ranking.append({
+            "key": k,
+            "weight": effective_weight(store, k),
+            "up": up,
+            "down": down,
+        })
+    ranking.sort(key=lambda r: r["weight"], reverse=True)
+
+    return {
+        "fileId": uuid.uuid4().hex,
+        "durationSec": duration,
+        "transcript": transcript_text,
+        "segments": [
+            {"start": s["start"], "end": s["end"], "text": s["text"]}
+            for s in segments
+        ],
+        "qna": qna_payload,
+        "qnaSummary": qna_summary,
+        "qnaInsight": qna_insight,
+        "feedback": fb,
+        "ranking": ranking,
+        "visuals": visuals,
+    }
+
+
+@app.post("/api/analyze")
+async def api_analyze(
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
+    language: Optional[str] = Form("auto"),
+    prompt: Optional[str] = Form(""),
+    translate: bool = Form(False),
+):
+    # 1. obtain a local media file
+    if file is not None:
+        suffix = Path(file.filename or "upload.bin").suffix or ".bin"
+        local_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+        with open(local_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    elif url:
+        local_path = _download_media_from_url(url, UPLOAD_DIR)
+    else:
+        return JSONResponse({"error": "Provide either a file or a url."}, status_code=400)
+
     try:
-     demo.queue(max_size=4).launch(
-        show_api=False,
-        share=share_flag,
-        server_name=host,
-        server_port=port,
-    )
+        payload = _run_full_pipeline(local_path, language or "auto", prompt or "", bool(translate))
+        return JSONResponse(payload)
     except Exception as e:
-        print("[gradio] launch error:", e)
-        demo.queue(max_size=4).launch(
-            show_api=False,
-            share=False,
-            server_name="127.0.0.1",
-            server_port=None,
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/analyze-stream")
+async def api_analyze_stream(
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
+    language: Optional[str] = Form("auto"),
+    prompt: Optional[str] = Form(""),
+    translate: bool = Form(False),
+):
+    # 1. obtain a local media file
+    if file is not None:
+        suffix = Path(file.filename or "upload.bin").suffix or ".bin"
+        local_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+        with open(local_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    elif url:
+        local_path = _download_media_from_url(url, UPLOAD_DIR)
+    else:
+        return JSONResponse({"error": "Provide either a file or a url."}, status_code=400)
+
+    def generate():
+        import json
+        file_id = uuid.uuid4().hex
+        audio_len = _ffprobe_duration(local_path)
+        yield f"data: {json.dumps({'type': 'progress', 'status': 'Transcribing...', 'durationSec': audio_len})}\n\n"
+        
+        task_mode = "translate" if translate else "transcribe"
+        use_long = ALWAYS_SEGMENT or (audio_len and audio_len > MAX_DIRECT_SEC)
+        
+        all_segments = []
+        transcript_parts = []
+        
+        try:
+            if use_long:
+                wav = ensure_wav(local_path)
+                parts = segment_wav(wav, CHUNK_SEC)
+                total_off = 0.0
+                for idx, part in enumerate(parts, 1):
+                    first_prompt = prompt if idx == 1 else ""
+                    yield f"data: {json.dumps({'type': 'progress', 'status': f'Transcribing chunk {idx}/{len(parts)}'})}\n\n"
+                    for seg, _dur in transcribe_wav_iter(part, language or "auto", first_prompt, task_mode):
+                        seg2 = {"start": seg["start"] + total_off, "end": seg["end"] + total_off, "text": seg["text"]}
+                        all_segments.append(seg2)
+                        if seg2["text"]:
+                            transcript_parts.append(seg2["text"])
+                            yield f"data: {json.dumps({'type': 'segment', 'segment': seg2})}\n\n"
+                    total_off += float(CHUNK_SEC)
+            else:
+                wav = extract_audio(local_path)
+                for seg, _dur in transcribe_wav_iter(wav, language or "auto", prompt, task_mode):
+                    all_segments.append(seg)
+                    if seg["text"]:
+                        transcript_parts.append(seg["text"])
+                        yield f"data: {json.dumps({'type': 'segment', 'segment': seg})}\n\n"
+            
+            yield f"data: {json.dumps({'type': 'progress', 'status': 'Analyzing visuals...'})}\n\n"
+            visuals = analyze_visuals(local_path, file_id)
+
+            yield f"data: {json.dumps({'type': 'progress', 'status': 'Generating insights...'})}\n\n"
+            
+            transcript_text = " ".join(transcript_parts)
+            items, qna_insight = extract_qna_with_ai(transcript_text, all_segments, visual_data=visuals)
+            qna_summary = qna_summary_from_items(items, visual_data=visuals)
+            qna_payload = [
+                {
+                    "t": it.get("t", "00:00"),
+                    "speaker": it.get("speaker", "student"),
+                    "student_id": it.get("student_id", "s?"),
+                    "answered": bool(it.get("answered", False)),
+                    "text": it.get("text", ""),
+                }
+                for it in items
+            ]
+            
+            fb = {}
+            
+            store = _load_weights()
+            ranking = []
+            # We initialize ranking with all available models so the frontend can display them.
+            for k in MODEL_DISPLAY_NAMES.keys():
+                up, down = _vote_tuple(store, k)
+                ranking.append({
+                    "key": k,
+                    "weight": effective_weight(store, k),
+                    "up": up,
+                    "down": down,
+                })
+            ranking.sort(key=lambda r: r["weight"], reverse=True)
+            
+            final_result = {
+                "type": "result",
+                "fileId": file_id,
+                "durationSec": audio_len,
+                "transcript": transcript_text,
+                "segments": all_segments,
+                "qna": qna_payload,
+                "qnaSummary": qna_summary,
+                "qnaInsight": qna_insight,
+                "feedback": fb,
+                "ranking": ranking,
+                "visuals": visuals,
+            }
+            
+            yield f"data: {json.dumps(final_result)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.post("/api/feedback")
+async def api_feedback(payload: Dict[str, Any]):
+    transcript_text = payload.get("transcript", "")
+    segments = payload.get("segments", [])
+    mode = payload.get("mode", "all")
+    visual_data = payload.get("visual_data")
+    
+    if not transcript_text:
+        return JSONResponse({"error": "Missing 'transcript'"}, status_code=400)
+        
+    fb = get_feedbacks(transcript_text, segments, mode=mode, visual_data=visual_data)
+    fb.pop("_ordered_keys", None)
+    
+    return {"feedback": fb}
+
+
+@app.post("/api/vote")
+async def api_vote(payload: Dict[str, Any]):
+    model_key = payload.get("model")
+    upvote = bool(payload.get("up", True))
+    if not model_key:
+        return JSONResponse({"error": "Missing 'model'"}, status_code=400)
+    register_vote(model_key, upvote)
+    return {"ok": True}
+
+
+@app.get("/api/vote/link")
+async def api_vote_link(model: str, up: int = 1):
+    if not model:
+        return HTMLResponse("<h1>Error: Missing model parameter</h1>", status_code=400)
+    
+    register_vote(model, bool(up))
+    action = "Upvoted" if up else "Downvoted"
+    color = "#2ecc71" if up else "#e74c3c"
+    
+    html_content = f"""
+    <html>
+        <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+            <h1 style="color: {color};">{action} successfully!</h1>
+            <p>Thank you for voting on the feedback.</p>
+            <p>You can close this window now.</p>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
+@app.post("/api/email")
+async def api_email(payload: Dict[str, Any]):
+    model_key = payload.get("model")
+    recipients = payload.get("recipients", "")
+    feedback_text = payload.get("feedback_text", "")
+    
+    if not model_key:
+        return JSONResponse({"error": "Missing 'model'"}, status_code=400)
+    
+    model_label = MODEL_DISPLAY_NAMES.get(model_key, model_key)
+    subject = f"{model_label} feedback report"
+    
+    text_body = (
+        f"{'='*50}\n"
+        f"{model_label.upper()} FEEDBACK REPORT\n"
+        f"{'='*50}\n\n"
+        f"{feedback_text}\n"
+    )
+    
+    feedback_html = _markdown_to_html(feedback_text)
+    
+    # Assuming local deployment for the API
+    base_url = "http://localhost:7860"
+    vote_url_up = f"{base_url}/api/vote/link?model={model_key}&up=1"
+    vote_url_down = f"{base_url}/api/vote/link?model={model_key}&up=0"
+    
+    html_body = (
+        f"<h2 style='color:#2c3e50;border-bottom:2px solid #3498db;padding-bottom:10px;'>{model_label} Feedback</h2>"
+        f"<div style='background:#f8f9fa;padding:15px;border-radius:5px;margin:10px 0;'>"
+        f"{feedback_html}"
+        f"</div>"
+        f"<div style='margin-top:30px; padding-top:20px; border-top:1px solid #ddd; text-align:center;'>"
+        f"  <p style='margin-bottom:15px; font-weight:bold; color:#2c3e50; font-size:16px;'>Was this feedback helpful?</p>"
+        f"  <a href='{vote_url_up}' style='display:inline-block; padding:12px 24px; background:#2ecc71; color:white; text-decoration:none; border-radius:6px; font-weight:bold; margin-right:15px;'>👍 Yes, Upvote</a>"
+        f"  <a href='{vote_url_down}' style='display:inline-block; padding:12px 24px; background:#e74c3c; color:white; text-decoration:none; border-radius:6px; font-weight:bold;'>👎 No, Downvote</a>"
+        f"</div>"
+    )
+
+    try:
+        send_report_to_recipients(
+            _parse_recipient_list(recipients) or APP_EMAIL_RECIPIENTS,
+            subject=subject,
+            body_text=text_body,
+            body_html=html_body,
+        )
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/health")
+async def api_health():
+    return {"ok": True, "service": "lecture-analyzer"}
+
+
+# Mount the existing Gradio UI at /gradio
+try:
+    app = gr.mount_gradio_app(app, demo, path="/gradio")
+except NameError:
+    pass
+
+# Serve the React frontend (if built)
+# Note: TanStack Start apps are SSR-based; if you want a pure SPA, you'd need SSG.
+# For now, we point to the built client assets.
+FRONTEND_DIST = Path(__file__).parent / "insight-engine" / "dist" / "client"
+if FRONTEND_DIST.exists() and (FRONTEND_DIST / "index.html").exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
+else:
+    @app.get("/")
+    async def root_fallback():
+        return {
+            "message": "Classroom Analyzer API is running.",
+            "frontend_status": "Built but missing index.html (common for TanStack Start SSR)." if FRONTEND_DIST.exists() else "Not built.",
+            "instructions": "For development, run 'npm run dev' in insight-engine and visit http://localhost:8080.",
+            "api_health": "/api/health",
+            "gradio_fallback": "/gradio"
+        }
+
+if __name__ == "__main__":
+    env_port = os.getenv("GRADIO_SERVER_PORT") or os.getenv("PORT") or "7860"
+    host = os.getenv("GRADIO_HOST", "0.0.0.0")
+    uvicorn.run(
+        app, 
+        host=host, 
+        port=int(env_port)
     )

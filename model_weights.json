@@ -5,7 +5,11 @@
       "down": 0
     },
     "scout": {
-      "up": 2,
+      "up": 4,
+      "down": 1
+    },
+    "gemini": {
+      "up": 1,
       "down": 0
     }
   },
